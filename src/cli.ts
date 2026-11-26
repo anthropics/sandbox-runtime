@@ -139,9 +139,25 @@ function parseControlFd(value: string): number {
 }
 
 /**
- * stdio for the sandboxed command: the three standard streams, plus
- * /dev/null over the control fd's slot, so nothing inside the sandbox can
- * read the channel that carries the policy confining it.
+ * Whether fd refers to a pipe/FIFO or socket whose open file description
+ * would be switched to O_NONBLOCK if Node/Bun wraps fd 1 or fd 2 into a
+ * libuv stream handle while sharing it with the sandboxed child (#861).
+ */
+function isStreamFd(fd: number): boolean {
+  try {
+    const stat = fs.fstatSync(fd)
+    return stat.isFIFO() || stat.isSocket()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * stdio for the sandboxed command: the three standard streams (with a fresh
+ * pipe for stdout/stderr whenever srt's own fd is a FIFO/socket, so lazy
+ * libuv stream initialization in srt cannot set O_NONBLOCK on the child's
+ * descriptor), plus /dev/null over the control fd's slot, so nothing inside
+ * the sandbox can read the channel that carries the policy confining it.
  *
  * The displacement is what matters on Linux. On macOS libuv spawns through
  * posix_spawn with POSIX_SPAWN_CLOEXEC_DEFAULT, which already keeps every
@@ -149,11 +165,11 @@ function parseControlFd(value: string): number {
  */
 function sandboxedStdio(
   controlFd: number | undefined,
-): Array<'inherit' | 'ignore' | number> {
-  const stdio: Array<'inherit' | 'ignore' | number> = [
+): Array<'inherit' | 'pipe' | 'ignore' | number> {
+  const stdio: Array<'inherit' | 'pipe' | 'ignore' | number> = [
     'inherit',
-    'inherit',
-    'inherit',
+    isStreamFd(1) ? 'pipe' : 'inherit',
+    isStreamFd(2) ? 'pipe' : 'inherit',
   ]
   if (controlFd === undefined) {
     return stdio
@@ -171,6 +187,71 @@ function sandboxedStdio(
   // cannot be re-opened through /proc/self/fd at all (ENXIO).
   stdio.push(fs.openSync('/dev/null', 'r'))
   return stdio
+}
+
+const brokenStdio = new WeakSet<NodeJS.WriteStream>()
+const epipeGuardedStdio = new WeakSet<NodeJS.WriteStream>()
+
+function guardStdioEpipe(out: NodeJS.WriteStream): void {
+  if (epipeGuardedStdio.has(out)) {
+    return
+  }
+  epipeGuardedStdio.add(out)
+  // Keep guarding through process exit: libuv can deliver EPIPE for an
+  // already-queued write on the tick after src finishes or write('', cb) runs.
+  out.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EPIPE' || err.code === 'ERR_STREAM_DESTROYED') {
+      brokenStdio.add(out)
+      return
+    }
+    throw err
+  })
+}
+
+function relayStreamToStdio(
+  src: NodeJS.ReadableStream | null | undefined,
+  dest: NodeJS.WriteStream,
+): Promise<void> {
+  if (!src) {
+    return Promise.resolve()
+  }
+  guardStdioEpipe(dest)
+  const onDestError = (err: NodeJS.ErrnoException): void => {
+    if (err.code === 'EPIPE' || err.code === 'ERR_STREAM_DESTROYED') {
+      src.unpipe(dest)
+      if ('destroy' in src && typeof src.destroy === 'function') {
+        src.destroy()
+      }
+    }
+  }
+  dest.on('error', onDestError)
+  src.on('error', () => {})
+  src.pipe(dest, { end: false })
+  return finished(src)
+    .catch(() => {})
+    .finally(() => {
+      dest.off('error', onDestError)
+    })
+}
+
+function flushedStdio(out: NodeJS.WriteStream): Promise<void> {
+  if (!out.writable || out.destroyed || brokenStdio.has(out)) {
+    return Promise.resolve()
+  }
+  guardStdioEpipe(out)
+  return new Promise(resolve => {
+    const onError = (err: NodeJS.ErrnoException): void => {
+      if (err.code === 'EPIPE' || err.code === 'ERR_STREAM_DESTROYED') {
+        out.off('error', onError)
+        resolve()
+      }
+    }
+    out.on('error', onError)
+    out.write('', () => {
+      out.off('error', onError)
+      resolve()
+    })
+  })
 }
 
 async function main(): Promise<void> {
@@ -644,8 +725,10 @@ async function main(): Promise<void> {
                 return true
               },
             }
-            proc.stdout?.pipe(process.stdout, { end: false })
-            proc.stderr?.pipe(process.stderr, { end: false })
+            const drained = Promise.all([
+              relayStreamToStdio(proc.stdout, process.stdout),
+              relayStreamToStdio(proc.stderr, process.stderr),
+            ])
             const stdin = proc.stdin
             if (stdin) {
               // The command may exit without reading its input.
@@ -655,20 +738,13 @@ async function main(): Promise<void> {
             // Exit only once the command's output has been read to the
             // end and written out: a pipe on Windows is asynchronous,
             // and process.exit() would drop what is still queued.
-            const drained = Promise.all(
-              [proc.stdout, proc.stderr].map(s =>
-                s ? finished(s).catch(() => {}) : Promise.resolve(),
-              ),
-            )
-            const flushed = (out: NodeJS.WriteStream): Promise<void> =>
-              new Promise(resolve => out.write('', () => resolve()))
             proc
               .wait()
               .then(async ({ exitCode }) => {
                 await drained
                 await Promise.all([
-                  flushed(process.stdout),
-                  flushed(process.stderr),
+                  flushedStdio(process.stdout),
+                  flushedStdio(process.stderr),
                 ])
                 onCommandExit(exitCode, killedBy)
               })
@@ -712,7 +788,26 @@ async function main(): Promise<void> {
               stdio: sandboxedStdio(controlFd),
             })
             child = spawned
-            spawned.on('exit', onCommandExit)
+            const stdoutDrained = relayStreamToStdio(
+              spawned.stdout,
+              process.stdout,
+            )
+            const stderrDrained = relayStreamToStdio(
+              spawned.stderr,
+              process.stderr,
+            )
+            spawned.on('exit', async (code, signal) => {
+              await Promise.all([stdoutDrained, stderrDrained])
+              await Promise.all([
+                spawned.stdout
+                  ? flushedStdio(process.stdout)
+                  : Promise.resolve(),
+                spawned.stderr
+                  ? flushedStdio(process.stderr)
+                  : Promise.resolve(),
+              ])
+              onCommandExit(code, signal)
+            })
             spawned.on('error', error => {
               console.error(`Failed to execute command: ${error.message}`)
               process.exit(1)
