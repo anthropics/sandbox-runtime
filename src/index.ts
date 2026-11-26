@@ -2,6 +2,7 @@
 export {
   SandboxManager,
   SandboxInitializeConflictError,
+  WindowsAclReleaseError,
 } from './sandbox/sandbox-manager.js'
 export type { WindowsProfileReadWarning } from './sandbox/sandbox-manager.js'
 export type {
@@ -122,6 +123,7 @@ export type {
   WindowsWfpProbeOutcome,
   WindowsWfpResidual,
   WindowsAclRevokeResult,
+  WindowsAclRecoveryReport,
   WindowsProfileGrantState,
   WindowsProfileGrantStatus,
   WindowsProfileGrantPath,

@@ -81,8 +81,10 @@ import {
   parseWindowsBinShell,
   expandWindowsFsPaths,
   rankWindowsFsAccess,
-  restoreWindowsAcl,
+  restoreWindowsAclChecked,
   grantWindowsAclPersistent,
+  recoverWindowsAclAsync,
+  type WindowsAclRecoveryReport,
   WINDOWS_INSTALL_COMMAND,
   windowsSetupVersionMismatch,
   windowsSrtWinOutdatedError,
@@ -167,7 +169,7 @@ import {
   type ResolvedAddressGuard,
 } from './resolved-address-guard.js'
 import { EOL } from 'node:os'
-import { dirname } from 'node:path'
+import { dirname, join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { getJavaProxyAgentJarPathAsync } from './java-proxy-agent.js'
 import { getApplySeccompBinaryPathAsync } from './generate-seccomp-filter.js'
@@ -199,6 +201,7 @@ let pendingInitialize:
   | { promise: Promise<void>; generation: number; args: unknown[] }
   | undefined
 let initializeGeneration = 0
+let pendingReset: Promise<void> | undefined
 // Kills the profile grant a refresh is running, at reset().
 let windowsProfileGrantAbort: AbortController | undefined
 let cleanupRegistered = false
@@ -226,7 +229,13 @@ let windowsFsStampedSet: WindowsFsAccessSet | undefined
 // The sandbox user SID captured at initialize(). reset() uses this
 // so a config change between init and reset can't strand ACEs
 // under a different SID.
-let windowsFsSbUserSid: string | undefined
+let windowsAclSession: WindowsAclContext | undefined
+let windowsAclGrantInFlight:
+  | {
+      context: WindowsAclContext
+      promise: Promise<void>
+    }
+  | undefined
 // The RAW config inputs that produced `windowsFsStampedSet`.
 // updateConfig() compares these (not the resolved set) so it never
 // re-expands globs — see `sameWindowsStampSet`.
@@ -541,14 +550,230 @@ function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
   return false
 }
 
-function releaseWindowsSessionAcls(
-  sandboxUserSid: string,
-  srtWin: SrtWinSpawn | undefined,
-): void {
-  const o = { sandboxUserSid, srtWin }
-  if (windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) {
-    logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
+/**
+ * {@link reset} could not release this process's Windows ACL session:
+ * a grant or deny ACE may still be on disk. The release stays pending:
+ * the next reset() runs it again.
+ */
+export class WindowsAclReleaseError extends Error {
+  readonly code = 'acl_release_failed'
+  constructor(
+    /** The `srt-win acl` step that did not complete. */
+    readonly step: 'revoke' | 'restore',
+    /** Paths reported as not released; empty when srt-win reported none. */
+    readonly paths: readonly string[],
+  ) {
+    super(
+      `Windows ACL ${step} did not complete; ACEs may be left in place` +
+        (paths.length > 0 ? ` at ${paths.map(p => `'${p}'`).join(', ')}` : '') +
+        '. Call reset() again to retry.',
+    )
+    this.name = 'WindowsAclReleaseError'
   }
+}
+
+// A later session may use a different helper or sandbox user. Keep each
+// failed release until that context's own revoke and restore complete.
+type WindowsAclContext = {
+  sandboxUserSid: string
+  srtWin: SrtWinSpawn
+  // The ledger observed around the grant. Unset when it could not be
+  // established, which leaves every release of the context incomplete.
+  ledger?: WindowsAclLedger
+}
+
+/** Identities (`dev:ino`) of the helper's state directory and database. */
+type WindowsAclLedger = { dir: string; db: string }
+
+const windowsAclReleasePending = new Map<string, WindowsAclContext>()
+
+function windowsAclReleaseKey({
+  sandboxUserSid,
+  srtWin,
+  ledger,
+}: WindowsAclContext): string {
+  return JSON.stringify([
+    sandboxUserSid,
+    srtWin.exe,
+    srtWin.prependArgs,
+    srtWin.stateEnv,
+    ledger ? [ledger.dir, ledger.db] : null,
+  ])
+}
+
+/**
+ * Identity of the object at `p`, links followed; `'absent'` only when no
+ * entry exists there (a dangling link is not absent), and unset when it
+ * could not be read.
+ */
+function observeWindowsFile(p: string): string | 'absent' | undefined {
+  try {
+    const { dev, ino } = fs.statSync(p, { bigint: true })
+    return ino === 0n ? undefined : `${dev}:${ino}`
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return undefined
+  }
+  try {
+    fs.lstatSync(p)
+    return undefined
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ENOENT' ? 'absent' : undefined
+  }
+}
+
+/**
+ * Identity of the directory at `p` when it is not itself a link
+ * (symbolic link, junction or mount point); unset otherwise.
+ */
+function windowsPlainDirectory(p: string): string | undefined {
+  try {
+    const st = fs.lstatSync(p, { bigint: true })
+    if (!st.isDirectory() || st.isSymbolicLink() || st.ino === 0n) {
+      return undefined
+    }
+    return `${st.dev}:${st.ino}`
+  } catch {
+    return undefined
+  }
+}
+
+/** Identity of the object at `p`, links followed; unset if unavailable. */
+function windowsFileIdentity(p: string): string | undefined {
+  const id = observeWindowsFile(p)
+  return id === 'absent' ? undefined : id
+}
+
+function windowsAclStateDir(srtWin: SrtWinSpawn): string | undefined {
+  const base = srtWin.stateEnv?.LOCALAPPDATA
+  return base ? join(base, 'sandbox-runtime') : undefined
+}
+
+function readWindowsAclLedger(
+  srtWin: SrtWinSpawn,
+): WindowsAclLedger | undefined {
+  const dir = windowsAclStateDir(srtWin)
+  if (!dir) return undefined
+  const dirId = windowsFileIdentity(dir)
+  const dbId = windowsFileIdentity(join(dir, 'state.db'))
+  return dirId && dbId ? { dir: dirId, db: dbId } : undefined
+}
+
+/**
+ * The state directory and database as seen before a grant. `'absent'`
+ * marks one confirmed not to exist yet; unset when either could not be
+ * read.
+ */
+type WindowsAclLedgerObservation = {
+  dir: string | 'absent'
+  db: string | 'absent'
+}
+
+function observeWindowsAclLedger(
+  srtWin: SrtWinSpawn,
+): WindowsAclLedgerObservation | undefined {
+  const dir = windowsAclStateDir(srtWin)
+  if (!dir) return undefined
+  const dirId = observeWindowsFile(dir)
+  if (dirId === undefined) return undefined
+  if (dirId === 'absent') return { dir: dirId, db: 'absent' }
+  const dbId = observeWindowsFile(join(dir, 'state.db'))
+  return dbId === undefined ? undefined : { dir: dirId, db: dbId }
+}
+
+/**
+ * The ledger a grant leaves behind, given what was observed before it.
+ * One that existed must still be the same directory and database; only
+ * one confirmed absent may be created. Anything else, a rotated or
+ * replaced database included, leaves the ledger unestablished.
+ */
+function windowsAclLedgerAfterGrant(
+  srtWin: SrtWinSpawn,
+  before: WindowsAclLedgerObservation | undefined,
+): WindowsAclLedger | undefined {
+  const after = readWindowsAclLedger(srtWin)
+  if (!before || !after) return undefined
+  if (before.dir === 'absent') {
+    // A first use counts only if the grant created a plain directory.
+    if (windowsPlainDirectory(windowsAclStateDir(srtWin)!) !== after.dir) {
+      return undefined
+    }
+  } else if (before.dir !== after.dir) return undefined
+  if (before.db !== 'absent' && before.db !== after.db) return undefined
+  return after
+}
+
+/** A stat still shows the ledger observed around the grant. */
+function windowsAclLedgerConfirmed(o: WindowsAclContext): boolean {
+  return (
+    o.ledger !== undefined &&
+    isDeepStrictEqual(readWindowsAclLedger(o.srtWin), o.ledger)
+  )
+}
+
+/**
+ * The helper keeps one ledger per state directory and selects a holder's
+ * rows by PID, so a release for another SID would consume a pending
+ * release's rows and leave its ACEs. Retry every other-SID release whose
+ * state directory is the same object, or cannot be told apart, first; an
+ * incomplete one blocks the new session. Returns the state directory as
+ * observed for that check.
+ */
+function drainWindowsAclReleasesSharingLedger(
+  sandboxUserSid: string,
+  srtWin: SrtWinSpawn,
+): string | 'absent' | undefined {
+  const stateDir = windowsAclStateDir(srtWin)
+  const observed = stateDir ? observeWindowsFile(stateDir) : undefined
+  const dir = observed === 'absent' ? undefined : observed
+  for (const pending of [...windowsAclReleasePending.values()]) {
+    if (pending.sandboxUserSid === sandboxUserSid) continue
+    if (dir && pending.ledger && pending.ledger.dir !== dir) continue
+    const failure = releaseWindowsSessionAcls(pending)
+    if (failure) throw failure
+  }
+  return observed
+}
+
+/**
+ * Revoke, then (only after a completed revoke) restore this holder's
+ * ACEs. Each call counts only if a stat before and after it still shows
+ * the ledger observed around the grant. Returns the failure, if any, and records it for the next
+ * reset().
+ */
+function releaseWindowsSessionAcls(
+  o: WindowsAclContext,
+): WindowsAclReleaseError | undefined {
+  const key = windowsAclReleaseKey(o)
+  const unconfirmed = (): boolean => {
+    if (windowsAclLedgerConfirmed(o)) return false
+    logForDebugging(
+      '[Sandbox Windows] the original ACL ledger is unavailable',
+      {
+        level: 'error',
+      },
+    )
+    return true
+  }
+  let failure: WindowsAclReleaseError | undefined
+  if (unconfirmed()) {
+    failure = new WindowsAclReleaseError('revoke', [])
+  } else {
+    const revoke = revokeWindowsAclChecked(o)
+    if (!windowsAclRestoreAllowed(revoke)) {
+      failure = new WindowsAclReleaseError('revoke', revoke.pending)
+    } else if (unconfirmed()) {
+      failure = new WindowsAclReleaseError('revoke', [])
+    } else {
+      const restore = restoreWindowsAclChecked(o)
+      logWindowsAclOutcomes('deny restore', restore.outcomes)
+      if (!restore.complete || unconfirmed()) {
+        failure = new WindowsAclReleaseError('restore', restore.pending)
+      }
+    }
+  }
+  if (failure) windowsAclReleasePending.set(key, o)
+  else windowsAclReleasePending.delete(key)
+  return failure
 }
 
 /**
@@ -1160,6 +1385,15 @@ export interface SandboxInitializeOptions {
    */
   onWindowsProfileGrantProgress?: (line: string) => void
   /**
+   * Windows, srt-win backend: when set, initialize() first runs srt-win's
+   * crash recovery on its own and calls this with what it found: holders
+   * that died without releasing their ACEs, the ACEs removed, and grants
+   * that could not be released (`grantsPending`, possibly still on disk).
+   * Called only for a valid report. A callback exception is logged and
+   * initialization continues.
+   */
+  onWindowsAclRecovery?: (report: WindowsAclRecoveryReport) => void
+  /**
    * Windows, `windows.backend: 'mxc'`: for embedders that bundle the MXC
    * SDK, an object with its `probe()` and `spawn()`. The session uses it,
    * and `@microsoft/mxc-sdk` is not resolved.
@@ -1173,6 +1407,7 @@ async function initialize(
   enableLogMonitor = false,
   options?: SandboxInitializeOptions,
 ): Promise<void> {
+  if (pendingReset) await pendingReset.catch(() => {})
   const args = [runtimeConfig, sandboxAskCallback, enableLogMonitor, options]
   if (pendingInitialize) {
     const { promise, generation, args: running } = pendingInitialize
@@ -1455,7 +1690,7 @@ async function initializeSteps(
   }
   if (getPlatform() === 'windows' && !windowsMxcState) {
     // Resolve once (stats disk); captured module-level for wrap/reset.
-    srtWinSpawn = resolveSrtWin(runtimeConfig.windows?.srtWin)
+    srtWinSpawn = resolveSrtWin(runtimeConfig.windows?.srtWin, true)
     const srtWin = srtWinSpawn
     const u = await getWindowsSandboxUserStatusAsync({ srtWin })
     stopIfReset()
@@ -1480,10 +1715,52 @@ async function initializeSteps(
       config = undefined
       throw new WindowsSandboxError('reinstall_required', staleSetup)
     }
+    let checkedStateDir: string | 'absent' | undefined
+    if (u.sid) {
+      try {
+        checkedStateDir = drainWindowsAclReleasesSharingLedger(u.sid, srtWin)
+      } catch (e) {
+        srtWinSpawn = undefined
+        config = undefined
+        throw e
+      }
+    }
+    // Asked for: run crash recovery on its own before any srt-win call
+    // that takes the init lock (a profile grant refresh and the session
+    // grant both recover too), so its counts reach the embedder.
+    // Best-effort.
+    const onRecovery = options?.onWindowsAclRecovery
+    if (onRecovery) {
+      let report: WindowsAclRecoveryReport | undefined
+      try {
+        report = await recoverWindowsAclAsync({ srtWin })
+      } catch (e) {
+        logForDebugging(
+          `[Sandbox Windows] acl recover: ${(e as Error).message}`,
+          { level: 'warn' },
+        )
+      }
+      stopIfReset()
+      if (report) {
+        try {
+          onRecovery(report)
+        } catch {
+          try {
+            logForDebugging('[Sandbox Windows] recovery callback threw', {
+              level: 'warn',
+            })
+          } catch {
+            // An embedder can also replace the debug output sink.
+          }
+        }
+        stopIfReset()
+      }
+    }
     // initialize() writes the profile read grant only to narrow one
     // already there (windowsProfileGrantRefreshable).
     windowsProfileReadWarnings = []
     windowsProfileReadRefresh = undefined
+    let grantContext: WindowsAclContext | undefined
     let profileRead: 'granted' | 'absent' = 'absent'
     let profileExclusions: Parameters<
       typeof windowsProfileExclusionConflicts
@@ -1698,25 +1975,48 @@ async function initializeSteps(
         )
       }
       const sb = u.sid
-      // Record module-level state BEFORE the first acl call so the
-      // catch's best-effort revoke/restore can address whatever
-      // partially landed.
-      windowsFsSbUserSid = sb
-      // One call, always made: it also records this process as a
-      // session. Write roots are kept at reset(); a failure throws.
-      await grantWindowsAclPersistent({
-        sandboxUserSid: sb,
+      // Observed before the grant and again when it settles; a release
+      // must find that same ledger. Other SIDs' pending releases were
+      // checked against the state directory seen earlier. If an existing
+      // one is no longer that directory, one absent then is now anything
+      // but a plain directory, or either could not be read, check again
+      // here and leave this session's ledger unestablished.
+      const before = observeWindowsAclLedger(srtWin)
+      const sameStateDir =
+        checkedStateDir === 'absent'
+          ? before !== undefined &&
+            (before.dir === 'absent' ||
+              windowsPlainDirectory(windowsAclStateDir(srtWin)!) === before.dir)
+          : checkedStateDir !== undefined && before?.dir === checkedStateDir
+      if (!sameStateDir) {
+        try {
+          drainWindowsAclReleasesSharingLedger(sb, srtWin)
+        } catch (e) {
+          if (generation === initializeGeneration) srtWinSpawn = undefined
+          throw e
+        }
+      }
+      const context: WindowsAclContext = { sandboxUserSid: sb, srtWin }
+      grantContext = context
+      // Reset can take ownership while this helper still has work to do.
+      const promise = grantWindowsAclPersistent({
+        ...context,
         read: grantRead,
         write: acc.grantWrite,
         denyRead: acc.denyRead,
         denyWrite: acc.denyWrite,
         allowProfileExclusions: override,
-        srtWin,
+      }).finally(() => {
+        context.ledger = sameStateDir
+          ? windowsAclLedgerAfterGrant(srtWin, before)
+          : undefined
       })
+      windowsAclGrantInFlight = { context, promise }
+      await promise
       stopIfReset()
-      // Gates running revoke/restore at reset(): every session is
-      // recorded with srt-win, whatever it was given. Set before the
-      // probe, so that a reset() during it releases what was granted.
+      windowsAclGrantInFlight = undefined
+      // Record the session before the asynchronous WFP probe.
+      windowsAclSession = context
       windowsFsStampedSet = acc
       logForDebugging(
         `[Sandbox Windows] fs applied: ` +
@@ -1750,16 +2050,16 @@ async function initializeSteps(
       }
       windowsFsRawInputs = rawWindowsFsInputs(runtimeConfig)
     } catch (e) {
-      // Best-effort release of whatever WAS applied before the
-      // failure (exit-2 partial stamps/grants the resolvable
-      // inputs; harmless if nothing was — no holds for this PID).
-      if (windowsFsSbUserSid) {
-        releaseWindowsSessionAcls(windowsFsSbUserSid, srtWin)
+      // A failed grant may have committed some ACEs. Reset owns cleanup
+      // after cancelling this generation.
+      if (generation === initializeGeneration) {
+        if (grantContext) releaseWindowsSessionAcls(grantContext)
+        windowsAclGrantInFlight = undefined
+        windowsAclSession = undefined
+        windowsFsStampedSet = undefined
+        windowsProfileRead = undefined
+        config = undefined
       }
-      windowsFsSbUserSid = undefined
-      windowsFsStampedSet = undefined
-      windowsProfileRead = undefined
-      config = undefined
       throw e
     }
   }
@@ -3213,7 +3513,10 @@ async function wrapWithSandboxArgv(
     // instead of failing on a flag it does not know.
     assertWindowsSrtWinCapable(
       customConfig?.windows?.srtWin
-        ? resolveSrtWin(customConfig.windows.srtWin)
+        ? {
+            ...resolveSrtWin(customConfig.windows.srtWin),
+            stateEnv: srtWinSpawn?.stateEnv,
+          }
         : (srtWinSpawn ?? resolveSrtWin(config?.windows?.srtWin)),
     )
     // The loopback mode is the one initialize() probed the fence with.
@@ -3265,13 +3568,16 @@ async function wrapWithSandboxArgv(
       caCertPath: mitmCA?.trustBundlePath,
       // srt-win verifies the holder and otherwise holds for the command
       // itself.
-      heldBy: windowsFsSbUserSid !== undefined ? process.pid : undefined,
+      heldBy: windowsAclSession !== undefined ? process.pid : undefined,
       // The roots initialize() granted persistently; their capability
       // SIDs are what let this command write them.
       writeRoots: windowsFsStampedSet?.grantWrite,
       binShell: parseWindowsBinShell(binShell),
       srtWin: customConfig?.windows?.srtWin
-        ? resolveSrtWin(customConfig.windows.srtWin)
+        ? {
+            ...resolveSrtWin(customConfig.windows.srtWin),
+            stateEnv: srtWinSpawn?.stateEnv,
+          }
         : (srtWinSpawn ?? resolveSrtWin(config?.windows?.srtWin)),
     })
   }
@@ -3680,22 +3986,37 @@ function forceCloseHttpServer(
 }
 
 async function reset(): Promise<void> {
+  if (pendingReset) return pendingReset
+  pendingReset = resetOnce()
+  try {
+    await pendingReset
+  } finally {
+    pendingReset = undefined
+  }
+}
+
+async function resetOnce(): Promise<void> {
   initializeGeneration++
   windowsProfileGrantAbort?.abort()
-  // Windows: release this session's sandbox-user ACEs. Best-effort:
-  // log anomalies rather than throw, so teardown always completes.
+  // Windows: release this session's sandbox-user ACEs and retry any
+  // unfinished releases. A failed release rejects after teardown.
   // Persistent write roots and the denies under them are not released.
-  if (windowsFsStampedSet && windowsFsSbUserSid) {
-    const sb = windowsFsSbUserSid
-    // Captured at initialize() — the SAME binary the grants/stamps
-    // were applied with, immune to `config` mutation between.
-    const srtWin = srtWinSpawn
-    // The 'exit'/signal handler lands here too: this part of
-    // reset() runs synchronously.
-    releaseWindowsSessionAcls(sb, srtWin)
+  let windowsAclReleaseFailure: WindowsAclReleaseError | undefined
+  const grant = windowsAclGrantInFlight
+  const current = grant?.context ?? windowsAclSession
+  // Committed sessions can still release synchronously on process exit.
+  // An in-flight helper must settle before this holder's release runs.
+  if (grant) await grant.promise.catch(() => {})
+  const currentReleaseKey = current && windowsAclReleaseKey(current)
+  if (current) windowsAclReleaseFailure = releaseWindowsSessionAcls(current)
+  for (const [key, pending] of windowsAclReleasePending) {
+    if (key === currentReleaseKey) continue
+    const failure = releaseWindowsSessionAcls(pending)
+    windowsAclReleaseFailure ??= failure
   }
+  windowsAclGrantInFlight = undefined
+  windowsAclSession = undefined
   windowsFsStampedSet = undefined
-  windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
   srtWinSpawn = undefined
   windowsProfileRead = undefined
@@ -3809,6 +4130,7 @@ async function reset(): Promise<void> {
   commandTextsByKey.clear()
   commandNetworkListsByKey.clear()
   maskedFileStore.dispose()
+  if (windowsAclReleaseFailure) throw windowsAclReleaseFailure
 }
 
 /**
